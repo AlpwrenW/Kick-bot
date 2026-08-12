@@ -1,0 +1,2289 @@
+#!/usr/bin/env python3
+"""
+Kick Canli Yayin Bildirim Botu + Sunucu Loglama Paketi (JSON dosya surumu)
+---------------------------------------------------------------------------
+Ozellikler:
+  - /yayinciekle veya /izlemebaslat: Kick yayincisi takip listesine ekler
+  - /topluekle: Birden fazla Kick yayincisini TEK KOMUTLA ekler
+  - /yayincisil veya /izlemedurdur: listeden cikarir
+  - Canli yayina gecince, yayin bitince ve kategori degisince otomatik bildirim
+  - /kanit: yayincinin su anki resmi Kick onizleme goreselini gonderir
+  - /loglamakanali: ban/unban/timeout/kick/mesaj sil-duzenle/katilma-ayrilma/
+    ses kanali loglarinin gonderilecegi kanali secer
+  - /hosgeldinkanali + /otorolayarla: yeni uye karsilama + otomatik rol
+  - /sunucubilgi: sunucu ve bot ayarlari ozeti
+  - /kesiftest: (deneysel) Kick chat'inde ban/timeout sinyali arar
+
+Veri basit bir JSON dosyasinda (guilds.json) saklanir. Railway'de veri
+kaybini onlemek icin bir "Volume" (kalici disk) baglayip DATA_DIR ortam
+degiskenini o volume'un mount yoluna ayarlayabilirsin (bkz. README).
+
+Gerekli ortam degiskenleri:
+    DISCORD_BOT_TOKEN
+    KICK_CLIENT_ID
+    KICK_CLIENT_SECRET
+    CHECK_INTERVAL_SECONDS   (opsiyonel, varsayilan 20)
+    DATA_DIR                 (opsiyonel - Railway Volume mount yolu, ör: /data)
+
+Calistirmak icin:
+    pip install -r requirements.txt
+    python bot.py
+
+NOT: Bu botun calismasi icin Discord Developer Portal'da su iki
+"Privileged Gateway Intent" AYARININ ACIK olmasi gerekiyor:
+    - SERVER MEMBERS INTENT
+    - MESSAGE CONTENT INTENT
+(Bot sekmesi -> Privileged Gateway Intents)
+"""
+
+import asyncio
+import io
+import json
+import os
+import time
+import random
+from datetime import datetime, timezone, timedelta
+
+import discord
+import requests
+import websockets
+from discord import app_commands
+from discord.ext import tasks
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+KICK_CLIENT_ID = os.getenv("KICK_CLIENT_ID")
+KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET")
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "20"))
+
+# Railway'de bir Volume baglarsan, onu mount ettigin yolu buraya
+# DATA_DIR olarak ver (ör: /data). Vermezsen dosya botun kendi
+# klasorunde tutulur (redeploy'da sifirlanabilir).
+DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+DATA_FILE = os.path.join(DATA_DIR, "guilds.json")
+RESTART_STATE_FILE = os.path.join(DATA_DIR, "restart_state.json")
+
+BOT_START_TIME = time.time()
+
+KICK_TOKEN_URL = "https://id.kick.com/oauth/token"
+KICK_CHANNELS_URL = "https://api.kick.com/public/v1/channels"
+KICK_UNOFFICIAL_CHANNEL_URL = "https://kick.com/api/v2/channels/{slug}"
+
+KICK_PUSHER_URL = (
+    "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679"
+    "?protocol=7&client=js&version=8.4.0-rc2&flash=false"
+)
+
+KICK_KNOWN_CHAT_EVENTS = {
+    "App\\Events\\ChatMessageEvent",
+    "App\\Events\\ChatMessageSentEvent",
+    "App\\Events\\FollowEvent",
+    "App\\Events\\SubscriptionEvent",
+    "App\\Events\\GiftedSubscriptionsEvent",
+    "pusher:connection_established",
+    "pusher_internal:subscription_succeeded",
+    "pusher:pong",
+    "pusher:ping",
+}
+
+# ------------------------------------------------------------------
+# Basit JSON dosya deposu
+# ------------------------------------------------------------------
+DEFAULT_GUILD_ENTRY = {
+    "channel_id": None,
+    "log_channel_id": None,
+    "welcome_channel_id": None,
+    "auto_role_id": None,
+    "streamers": {},
+    # Bildirim turune gore ayri kanal yonlendirmesi. Bos birakilanlar
+    # otomatik olarak "channel_id"yi kullanir (geriye donuk uyumluluk).
+    "notify_channels": {
+        "canli": None,
+        "kategori": None,
+        "klip": None,
+        "sabitmesaj": None,
+    },
+    # Gunluk foto onay sistemi
+    "photo_approval_channel_id": None,
+    "streaks": {},  # {user_id: {"streak": int, "last_date": "YYYY-MM-DD"}}
+    # Restart oncesi otomatik yedeklerin gonderilecegi kanal
+    "backup_channel_id": None,
+    # Kayit sistemi (isim, yas, roblox kullanici adi)
+    "registrations": {},  # {user_id: {"isim", "yas", "roblox_username", "roblox_id", "kayit_tarihi"}}
+    "ticket_channel_id": None,
+    "ticket_category_id": None,
+    "ticket_support_role_id": None,
+    "open_tickets": {},
+    "reaction_roles": {},
+    "giveaways": {},
+    "bot_protection": {"enabled": False, "min_account_age_days": 3, "raid_threshold": 5, "raid_window_seconds": 20},
+    "recent_joins": [],
+    "trap_channel_id": None,
+    "trap_users": {},
+}
+
+DAILY_WAIT_SECONDS = int(os.getenv("DAILY_WAIT_SECONDS", "120"))
+TRAP_TIMEOUT_DAYS = min(28, max(1, int(os.getenv("TRAP_TIMEOUT_DAYS", "28"))))
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def get_notify_channel_id(entry, tur):
+    """Bildirim turune ozel kanal ayarlanmissa onu, yoksa genel
+    kanal_id'yi doner."""
+    notify_channels = entry.get("notify_channels") or {}
+    return notify_channels.get(tur) or entry.get("channel_id")
+
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_data(data):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ------------------------------------------------------------------
+# /yenidenbaslat icin kucuk durum dosyasi - hangi mesaji "basariyla
+# yeniden basladi" diye guncellememiz gerektigini hatirlamak icin
+# ------------------------------------------------------------------
+def save_restart_state(channel_id: int, message_id: int):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(RESTART_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"channel_id": channel_id, "message_id": message_id}, f)
+
+
+def load_restart_state():
+    if os.path.exists(RESTART_STATE_FILE):
+        with open(RESTART_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def clear_restart_state():
+    if os.path.exists(RESTART_STATE_FILE):
+        os.remove(RESTART_STATE_FILE)
+
+
+def format_uptime(seconds: int) -> str:
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}g")
+    if hours:
+        parts.append(f"{hours}s")
+    parts.append(f"{minutes}dk")
+    return " ".join(parts)
+
+
+def get_guild_entry(data, guild_id: str):
+    if guild_id not in data:
+        data[guild_id] = json.loads(json.dumps(DEFAULT_GUILD_ENTRY))  # derin kopya
+        data[guild_id]["streamers"] = {}
+    else:
+        for key, default_value in DEFAULT_GUILD_ENTRY.items():
+            if key not in data[guild_id]:
+                data[guild_id][key] = json.loads(json.dumps(default_value))
+        # notify_channels alt alanlarini da tamamla (eski kayitlarda olmayabilir)
+        for sub_key in DEFAULT_GUILD_ENTRY["notify_channels"]:
+            data[guild_id]["notify_channels"].setdefault(sub_key, None)
+    return data[guild_id]
+
+
+def update_streak(guild_id: str, user_id: str) -> int:
+    """Fotograf onaylanınca cagrilir. Seriyi gunceller ve yeni degeri doner.
+    - Onceki gun de onaylandiysa: seri +1
+    - Bugun zaten onaylandiysa: degismez (ayni gun icinde tekrar sayilmaz)
+    - Araya gun girmisse: seri 1'e sifirlanir
+    """
+    data = load_data()
+    entry = get_guild_entry(data, guild_id)
+    streaks = entry.setdefault("streaks", {})
+    user_streak = streaks.get(user_id, {"streak": 0, "last_date": None})
+
+    today = datetime.now(timezone.utc).date()
+    last_date_str = user_streak.get("last_date")
+
+    if last_date_str:
+        last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+        diff = (today - last_date).days
+        if diff == 0:
+            pass  # ayni gun icinde tekrar onaylandi, seriyi degistirme
+        elif diff == 1:
+            user_streak["streak"] = user_streak.get("streak", 0) + 1
+            user_streak["last_date"] = today.isoformat()
+        else:
+            user_streak["streak"] = 1
+            user_streak["last_date"] = today.isoformat()
+    else:
+        user_streak["streak"] = 1
+        user_streak["last_date"] = today.isoformat()
+
+    streaks[user_id] = user_streak
+    save_data(data)
+    return user_streak["streak"]
+
+
+# ------------------------------------------------------------------
+# Kick API
+# ------------------------------------------------------------------
+_token_cache = {"access_token": None, "obtained_at": 0}
+
+
+def get_app_access_token():
+    now = time.time()
+    if _token_cache["access_token"] and (now - _token_cache["obtained_at"]) < 3500:
+        return _token_cache["access_token"]
+
+    resp = requests.post(
+        KICK_TOKEN_URL,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": KICK_CLIENT_ID,
+            "client_secret": KICK_CLIENT_SECRET,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    token = resp.json()["access_token"]
+    _token_cache["access_token"] = token
+    _token_cache["obtained_at"] = now
+    return token
+
+
+def get_channels_status(slugs):
+    if not slugs:
+        return {}
+    token = get_app_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    params = [("slug", s) for s in slugs]
+    resp = requests.get(KICK_CHANNELS_URL, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+
+    result = {}
+    for channel in data:
+        slug = channel.get("slug")
+        stream = channel.get("stream") or {}
+        category = channel.get("category") or {}
+        result[slug] = {
+            "is_live": bool(stream.get("is_live")),
+            "title": stream.get("stream_title") or channel.get("stream_title") or "",
+            "thumbnail": stream.get("thumbnail") or "",
+            "viewers": stream.get("viewer_count"),
+            "category": category.get("name"),
+            "url": f"https://kick.com/{slug}",
+        }
+    return result
+
+
+# ------------------------------------------------------------------
+# /kesiftest icin yardimci fonksiyonlar (DENEYSEL - resmi API degil)
+# ------------------------------------------------------------------
+async def resolve_chatroom_id(slug: str):
+    def _fetch():
+        resp = requests.get(
+            KICK_UNOFFICIAL_CHANNEL_URL.format(slug=slug),
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"
+                ),
+                "Accept": "application/json",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _fetch)
+    chatroom = data.get("chatroom") or {}
+    return chatroom.get("id")
+
+
+# ------------------------------------------------------------------
+# Klip ve sabitlenmis mesaj kontrolu (DENEYSEL - resmi/dokumante
+# edilmemis endpoint'ler kullaniliyor, calismama ihtimali var)
+# ------------------------------------------------------------------
+KICK_UNOFFICIAL_CLIPS_URL = "https://api.kick.com/private/v1/channels/{slug}/clips"
+KICK_UNOFFICIAL_PINNED_MESSAGE_URL = "https://kick.com/api/internal/v1/channels/{slug}/chatroom/pinned-message"
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+
+async def get_latest_clip(slug: str):
+    """En son klibi doner (bulamazsa/erisemezse None). Deneysel."""
+
+    def _fetch():
+        resp = requests.get(
+            KICK_UNOFFICIAL_CLIPS_URL.format(slug=slug),
+            headers=_BROWSER_HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _fetch)
+
+    clips = data.get("clips") if isinstance(data, dict) else data
+    if not clips:
+        return None
+
+    clip = clips[0]
+    return {
+        "id": clip.get("id"),
+        "title": clip.get("title") or "(basliksiz klip)",
+        "url": clip.get("clip_url") or clip.get("video_url") or f"https://kick.com/{slug}/clips",
+        "thumbnail": clip.get("thumbnail_url") or clip.get("thumbnail"),
+        "creator": (clip.get("creator") or {}).get("username") if isinstance(clip.get("creator"), dict) else None,
+    }
+
+
+async def get_pinned_message(slug: str):
+    """Su anki sabitlenmis mesaji doner (yoksa/erisemezse None). Deneysel."""
+
+    def _fetch():
+        resp = requests.get(
+            KICK_UNOFFICIAL_PINNED_MESSAGE_URL.format(slug=slug),
+            headers=_BROWSER_HEADERS,
+            timeout=15,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _fetch)
+
+    if not data:
+        return None
+
+    message_block = data.get("message") if isinstance(data, dict) else None
+    if not message_block:
+        return None
+
+    return {
+        "id": message_block.get("id"),
+        "content": message_block.get("content") or "(bos mesaj)",
+        "sender": (message_block.get("sender") or {}).get("username"),
+    }
+
+
+
+async def listen_for_unknown_events(chatroom_id: int, duration_seconds: int, max_events: int = 15):
+    channel_name = f"chatrooms.{chatroom_id}.v2"
+    found = []
+
+    try:
+        async with websockets.connect(KICK_PUSHER_URL, open_timeout=15) as ws:
+            await ws.send(json.dumps({
+                "event": "pusher:subscribe",
+                "data": {"channel": channel_name},
+            }))
+
+            end_time = time.time() + duration_seconds
+            while time.time() < end_time and len(found) < max_events:
+                remaining = end_time - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    message = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+
+                event_name = payload.get("event", "")
+                if event_name not in KICK_KNOWN_CHAT_EVENTS:
+                    found.append(payload)
+
+    except Exception as e:
+        return found, str(e)
+
+    return found, None
+
+
+# ------------------------------------------------------------------
+# Roblox API (herkese acik, kimlik dogrulama gerekmiyor)
+# ------------------------------------------------------------------
+ROBLOX_USERNAME_LOOKUP_URL = "https://users.roblox.com/v1/usernames/users"
+ROBLOX_USER_INFO_URL = "https://users.roblox.com/v1/users/{user_id}"
+ROBLOX_THUMBNAIL_URL = "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+
+
+async def get_roblox_user(username: str):
+    """Roblox kullanici adindan hesap bilgisi + profil foto URL'i getirir.
+    Bulunamazsa None doner."""
+
+    def _fetch():
+        resp = requests.post(
+            ROBLOX_USERNAME_LOOKUP_URL,
+            json={"usernames": [username], "excludeBannedUsers": False},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("data") or []
+        if not results:
+            return None
+        found = results[0]
+
+        info_resp = requests.get(ROBLOX_USER_INFO_URL.format(user_id=found["id"]), timeout=15)
+        info_resp.raise_for_status()
+        info = info_resp.json()
+
+        thumb_resp = requests.get(
+            ROBLOX_THUMBNAIL_URL,
+            params={
+                "userIds": found["id"],
+                "size": "150x150",
+                "format": "Png",
+                "isCircular": "false",
+            },
+            timeout=15,
+        )
+        thumb_resp.raise_for_status()
+        thumb_data = thumb_resp.json().get("data") or []
+        thumbnail_url = thumb_data[0]["imageUrl"] if thumb_data else None
+
+        return {
+            "id": found["id"],
+            "username": info.get("name"),
+            "display_name": info.get("displayName"),
+            "created": info.get("created"),
+            "is_banned": info.get("isBanned", False),
+            "thumbnail_url": thumbnail_url,
+            "profile_url": f"https://www.roblox.com/users/{found['id']}/profile",
+        }
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _fetch)
+
+
+def format_roblox_created(iso_str):
+    if not iso_str:
+        return "bilinmiyor"
+    try:
+        created = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except ValueError:
+        return iso_str
+    days = (datetime.now(timezone.utc) - created).days
+    return f"{created.strftime('%d.%m.%Y')} ({days} gun once)"
+
+
+# ------------------------------------------------------------------
+# Gemini AI (Google AI Studio)
+# ------------------------------------------------------------------
+async def ask_gemini(soru: str) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY ortam degiskeni ayarlanmamis.")
+
+    def _fetch():
+        url = GEMINI_URL_TEMPLATE.format(model=GEMINI_MODEL)
+        resp = requests.post(
+            url,
+            headers={
+                "x-goog-api-key": GEMINI_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={"contents": [{"parts": [{"text": soru}]}]},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return "Gemini bir cevap dondurmedi."
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        texts = [p.get("text", "") for p in parts if "text" in p]
+        joined = "\n".join(t for t in texts if t).strip()
+        return joined or "Gemini bos bir cevap dondurdu."
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _fetch)
+
+
+PROGRESS_BAR_SLOTS = 10
+
+
+async def _animate_progress_bar(message: discord.Message, soru: str):
+    """Gemini'den gercek cevap gelene kadar mesajdaki cubugu kabaca doldurur.
+    Gemini tek seferlik bir yanit dondurdugu icin (streaming degil) gercek
+    bir yuzde bilgimiz yok - zamana dayali bir tahmin gosteriyoruz."""
+    try:
+        for i in range(1, PROGRESS_BAR_SLOTS):
+            await asyncio.sleep(1.3)
+            filled = "█" * i
+            empty = "░" * (PROGRESS_BAR_SLOTS - i)
+            percent = int((i / PROGRESS_BAR_SLOTS) * 100)
+            try:
+                await message.edit(
+                    content=f"🤖 **Gemini'ye soruluyor...**\n`[{filled}{empty}]` {percent}%\n> {soru}"
+                )
+            except discord.DiscordException:
+                return
+    except asyncio.CancelledError:
+        return
+
+
+def build_backup_payload(entry: dict) -> dict:
+    return {
+        "streamers": entry.get("streamers", {}),
+        "streaks": entry.get("streaks", {}),
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ------------------------------------------------------------------
+# Discord bot kurulumu
+# ------------------------------------------------------------------
+intents = discord.Intents.default()
+intents.members = True          # katilma/ayrilma/timeout olaylari icin
+intents.message_content = True  # silinen/duzenlenen mesaj icerigini gorebilmek icin
+
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+
+@client.event
+async def on_ready():
+    print(f"[BILGI] Giris yapildi: {client.user}")
+    print(f"[BILGI] Veri dosyasi: {DATA_FILE}")
+
+    if not check_streams.is_running():
+        check_streams.start()
+    if not giveaway_loop.is_running():
+        giveaway_loop.start()
+    if not trap_timeout_loop.is_running():
+        trap_timeout_loop.start()
+    client.add_view(TicketPanelView())
+    client.add_view(TicketCloseView())
+
+    try:
+        synced = await tree.sync()
+        print(f"[BILGI] {len(synced)} komut Discord'a senkronize edildi: "
+              f"{', '.join(sorted(c.name for c in synced))}")
+    except Exception as e:
+        print(f"[HATA] Komutlar senkronize edilemedi: {e}")
+
+    # /yenidenbaslat sonrasi geri donduysek, o mesaji "basariyla acildi"
+    # diye guncelle
+    restart_state = load_restart_state()
+    if restart_state:
+        try:
+            channel = client.get_channel(restart_state["channel_id"]) or await client.fetch_channel(restart_state["channel_id"])
+            msg = await channel.fetch_message(restart_state["message_id"])
+            await msg.edit(content="✅ Bot basariyla yeniden baslatildi ve tekrar aktif!")
+        except Exception as e:
+            print(f"[UYARI] Yeniden baslatma mesaji guncellenemedi: {e}")
+        finally:
+            clear_restart_state()
+
+
+# ------------------------------------------------------------------
+# Ortak yardimcilar
+# ------------------------------------------------------------------
+async def find_audit_log_entry(guild: discord.Guild, action, target_id: int):
+    try:
+        async for entry in guild.audit_logs(action=action, limit=5):
+            if entry.target and entry.target.id == target_id:
+                return entry
+    except discord.Forbidden:
+        print("[UYARI] Audit log okuma yetkisi yok. Bota 'Denetim Kaydini Goruntule' yetkisi ver.")
+    except discord.HTTPException as e:
+        print(f"[HATA] Audit log okunamadi: {e}")
+    return None
+
+
+async def send_log_embed(entry, embed: discord.Embed):
+    log_channel_id = entry.get("log_channel_id")
+    if not log_channel_id:
+        return
+    channel = client.get_channel(log_channel_id)
+    if channel is None:
+        return
+    try:
+        await channel.send(embed=embed)
+    except discord.DiscordException as e:
+        print(f"[HATA] Log mesaji gonderilemedi: {e}")
+
+
+# ------------------------------------------------------------------
+# Kick takip komutlari
+# ------------------------------------------------------------------
+async def _add_streamer(interaction: discord.Interaction, kullanici_adi: str):
+    slug = kullanici_adi.strip().lower()
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+
+    if slug in entry["streamers"]:
+        await interaction.response.send_message(f"**{slug}** zaten listede.", ephemeral=True)
+        return
+
+    entry["streamers"][slug] = {"is_live": False, "category": None}
+    save_data(data)
+    await interaction.response.send_message(f"**{slug}** takip listesine eklendi.", ephemeral=True)
+
+
+async def _remove_streamer(interaction: discord.Interaction, kullanici_adi: str):
+    slug = kullanici_adi.strip().lower()
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+
+    if slug not in entry["streamers"]:
+        await interaction.response.send_message(f"**{slug}** listede bulunamadi.", ephemeral=True)
+        return
+
+    del entry["streamers"][slug]
+    save_data(data)
+    await interaction.response.send_message(f"**{slug}** listeden cikarildi.", ephemeral=True)
+
+
+@tree.command(name="kanalayarla", description="Kick canli yayin bildirimlerinin gonderilecegi kanali secer")
+@app_commands.describe(kanal="Bildirimlerin gonderilecegi metin kanali")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def kanalayarla(interaction: discord.Interaction, kanal: discord.TextChannel):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    entry["channel_id"] = kanal.id
+    save_data(data)
+    await interaction.response.send_message(f"Bildirim kanali {kanal.mention} olarak ayarlandi.", ephemeral=True)
+
+
+@tree.command(
+    name="bildirimkanaliayarla",
+    description="Canli/kategori/klip/sabit mesaj bildirimlerini FARKLI kanallara yonlendirir",
+)
+@app_commands.describe(
+    tur="Hangi bildirim turu icin ayarliyorsun",
+    kanal="Bu turun gonderilecegi metin kanali",
+)
+@app_commands.choices(
+    tur=[
+        app_commands.Choice(name="Canli yayina gecti", value="canli"),
+        app_commands.Choice(name="Kategori degisikligi", value="kategori"),
+        app_commands.Choice(name="Yeni klip", value="klip"),
+        app_commands.Choice(name="Sabitlenen mesaj", value="sabitmesaj"),
+    ]
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def bildirimkanaliayarla(interaction: discord.Interaction, tur: app_commands.Choice[str], kanal: discord.TextChannel):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    entry["notify_channels"][tur.value] = kanal.id
+    save_data(data)
+    await interaction.response.send_message(
+        f"**{tur.name}** bildirimleri artik {kanal.mention} kanalina gidecek.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="loglamakanali", description="Sunucu loglarinin (ban/timeout/kick/mesaj/katilma/ses) gonderilecegi kanali secer")
+@app_commands.describe(kanal="Loglarin gonderilecegi metin kanali")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def loglamakanali(interaction: discord.Interaction, kanal: discord.TextChannel):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    entry["log_channel_id"] = kanal.id
+    save_data(data)
+    await interaction.response.send_message(f"Log kanali {kanal.mention} olarak ayarlandi.", ephemeral=True)
+
+
+@tree.command(name="hosgeldinkanali", description="Yeni uye katilinca hos geldin mesajinin gonderilecegi kanali secer")
+@app_commands.describe(kanal="Hos geldin mesajlarinin gonderilecegi metin kanali")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def hosgeldinkanali(interaction: discord.Interaction, kanal: discord.TextChannel):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    entry["welcome_channel_id"] = kanal.id
+    save_data(data)
+    await interaction.response.send_message(f"Hos geldin kanali {kanal.mention} olarak ayarlandi.", ephemeral=True)
+
+
+@tree.command(name="otorolayarla", description="Yeni uyelere otomatik verilecek rolu secer")
+@app_commands.describe(rol="Yeni katilan uyelere otomatik verilecek rol")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def otorolayarla(interaction: discord.Interaction, rol: discord.Role):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    entry["auto_role_id"] = rol.id
+    save_data(data)
+    await interaction.response.send_message(f"Yeni uyelere otomatik olarak {rol.mention} rolu verilecek.", ephemeral=True)
+
+
+@tree.command(name="yayinciekle", description="Takip listesine bir Kick yayincisi ekler")
+@app_commands.describe(kullanici_adi="Kick kullanici adi (kick.com/KULLANICIADI)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def yayinciekle(interaction: discord.Interaction, kullanici_adi: str):
+    await _add_streamer(interaction, kullanici_adi)
+
+
+@tree.command(name="izlemebaslat", description="Bir Kick kanalini izlemeye baslar (yayinciekle ile ayni)")
+@app_commands.describe(kullanici_adi="Kick kullanici adi (kick.com/KULLANICIADI)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def izlemebaslat(interaction: discord.Interaction, kullanici_adi: str):
+    await _add_streamer(interaction, kullanici_adi)
+
+
+@tree.command(name="topluekle", description="Birden fazla Kick yayincisini TEK SEFERDE takip listesine ekler")
+@app_commands.describe(kullanici_adlari="Kullanici adlarini virgul VEYA alt alta (yeni satir) yaz, ornek: xqc, trainwreckstv, ninja")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def topluekle(interaction: discord.Interaction, kullanici_adlari: str):
+    raw_list = kullanici_adlari.replace(",", "\n").splitlines()
+    slugs = [s.strip().lower() for s in raw_list if s.strip()]
+
+    if not slugs:
+        await interaction.response.send_message("Gecerli bir kullanici adi bulamadim.", ephemeral=True)
+        return
+
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+
+    eklenen = []
+    zaten_vardi = []
+
+    for slug in slugs:
+        if slug in entry["streamers"]:
+            zaten_vardi.append(slug)
+        else:
+            entry["streamers"][slug] = {"is_live": False, "category": None}
+            eklenen.append(slug)
+
+    save_data(data)
+
+    parts = []
+    if eklenen:
+        parts.append(f"✅ **{len(eklenen)} yayinci eklendi:** {', '.join(eklenen)}")
+    if zaten_vardi:
+        parts.append(f"⏭️ **{len(zaten_vardi)} tanesi zaten listedeydi:** {', '.join(zaten_vardi)}")
+
+    await interaction.response.send_message("\n".join(parts), ephemeral=True)
+
+
+@tree.command(name="yayincisil", description="Takip listesinden bir Kick yayincisini cikarir")
+@app_commands.describe(kullanici_adi="Kick kullanici adi")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def yayincisil(interaction: discord.Interaction, kullanici_adi: str):
+    await _remove_streamer(interaction, kullanici_adi)
+
+
+@tree.command(name="izlemedurdur", description="Bir Kick kanalini izlemeyi durdurur (yayincisil ile ayni)")
+@app_commands.describe(kullanici_adi="Kick kullanici adi")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def izlemedurdur(interaction: discord.Interaction, kullanici_adi: str):
+    await _remove_streamer(interaction, kullanici_adi)
+
+
+@tree.command(name="liste", description="Takip edilen Kick yayincilarini listeler")
+async def liste(interaction: discord.Interaction):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    streamers = entry["streamers"]
+
+    if not streamers:
+        await interaction.response.send_message("Henuz takip edilen yayinci yok. `/yayinciekle` ya da `/topluekle` ile ekleyebilirsin.", ephemeral=True)
+        return
+
+    lines = []
+    for slug, info in streamers.items():
+        durum = "CANLI" if info.get("is_live") else "cevrimdisi"
+        category = info.get("category")
+        if info.get("is_live") and category:
+            lines.append(f"- **{slug}** — {durum} ({category})")
+        else:
+            lines.append(f"- **{slug}** — {durum}")
+
+    def ch_text(cid, cmd):
+        return f"<#{cid}>" if cid else f"ayarlanmadi (`{cmd}` kullan)"
+
+    nc = entry.get("notify_channels") or {}
+    ozel_yonlendirmeler = []
+    for tur, isim in [("kategori", "Kategori"), ("klip", "Klip"), ("sabitmesaj", "Sabit mesaj")]:
+        if nc.get(tur):
+            ozel_yonlendirmeler.append(f"{isim}: <#{nc[tur]}>")
+
+    ozel_text = ("\n" + "\n".join(ozel_yonlendirmeler)) if ozel_yonlendirmeler else ""
+
+    message = (
+        f"Bildirim kanali (varsayilan): {ch_text(entry.get('channel_id'), '/kanalayarla')}\n"
+        f"Log kanali: {ch_text(entry.get('log_channel_id'), '/loglamakanali')}"
+        f"{ozel_text}\n\n"
+        + "\n".join(lines)
+    )
+
+    # Discord mesaj limiti 2000 karakter - liste cok uzunsa dosya olarak gonder
+    if len(message) > 1900:
+        file_obj = discord.File(io.BytesIO(message.encode("utf-8")), filename="yayinci_listesi.txt")
+        await interaction.response.send_message("Liste uzun oldugu icin dosya olarak gonderiyorum:", file=file_obj, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+@tree.command(name="kanit", description="Kick yayincisinin su anki resmi Kick onizleme goreselini gonderir")
+@app_commands.describe(kullanici_adi="Kick kullanici adi")
+async def kanit(interaction: discord.Interaction, kullanici_adi: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    slug = kullanici_adi.strip().lower()
+
+    try:
+        statuses = get_channels_status([slug])
+    except Exception as e:
+        await interaction.followup.send(f"Kick bilgisi alinamadi: {e}", ephemeral=True)
+        return
+
+    info = statuses.get(slug)
+    if not info:
+        await interaction.followup.send("Kullanici bulunamadi. Kullanici adini kontrol et.", ephemeral=True)
+        return
+    if not info["is_live"]:
+        await interaction.followup.send(f"**{slug}** su an canli degil.", ephemeral=True)
+        return
+    if not info.get("thumbnail"):
+        await interaction.followup.send(
+            f"**{slug}** canli ama Kick henuz bir onizleme goreseli uretmemis, birazdan tekrar dene.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"{slug} - su anki onizleme goruntusu",
+        url=info["url"],
+        description=(
+            "Bu, Kick'in periyodik olarak urettigi resmi onizleme goreseli "
+            "(canli video akisindan saniyelik kare yakalama degildir)."
+        ),
+        color=0x53FC18,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if info.get("category"):
+        embed.add_field(name="Kategori", value=info["category"], inline=True)
+    if info.get("viewers") is not None:
+        embed.add_field(name="Izleyici", value=str(info["viewers"]), inline=True)
+    embed.set_image(url=info["thumbnail"])
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="sunucubilgi", description="Bu sunucu hakkinda genel bilgi ve bot ayarlarinin ozetini gosterir")
+async def sunucubilgi(interaction: discord.Interaction):
+    guild = interaction.guild
+    data = load_data()
+    entry = get_guild_entry(data, str(guild.id))
+
+    embed = discord.Embed(title=guild.name, color=0x5865F2, timestamp=datetime.now(timezone.utc))
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    embed.add_field(name="Uye sayisi", value=str(guild.member_count), inline=True)
+    embed.add_field(name="Olusturulma", value=guild.created_at.strftime("%d.%m.%Y"), inline=True)
+    embed.add_field(name="Takip edilen yayinci", value=str(len(entry["streamers"])), inline=True)
+
+    def ch_text(cid):
+        return f"<#{cid}>" if cid else "ayarlanmadi"
+
+    embed.add_field(name="Yayin bildirim kanali", value=ch_text(entry.get("channel_id")), inline=False)
+    embed.add_field(name="Log kanali", value=ch_text(entry.get("log_channel_id")), inline=False)
+    embed.add_field(name="Hos geldin kanali", value=ch_text(entry.get("welcome_channel_id")), inline=False)
+    embed.add_field(name="Foto onay kanali", value=ch_text(entry.get("photo_approval_channel_id")), inline=False)
+    embed.add_field(name="Kayitli kullanici sayisi", value=str(len(entry.get("registrations", {}))), inline=False)
+
+    auto_role_id = entry.get("auto_role_id")
+    embed.add_field(
+        name="Otomatik rol",
+        value=f"<@&{auto_role_id}>" if auto_role_id else "ayarlanmadi",
+        inline=False,
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="botdurumu", description="Botun anlik durumunu gosterir (calisma suresi, gecikme, sunucu sayisi vb.)")
+async def botdurumu(interaction: discord.Interaction):
+    uptime_seconds = time.time() - BOT_START_TIME
+    latency_ms = round(client.latency * 1000) if client.latency else "?"
+
+    data = load_data()
+    total_streamers = sum(len(e.get("streamers", {})) for e in data.values())
+    total_registrations = sum(len(e.get("registrations", {})) for e in data.values())
+
+    embed = discord.Embed(title="🤖 Bot Durumu", color=0x53FC18, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Durum", value="🟢 Cevrimici", inline=True)
+    embed.add_field(name="Gecikme (ping)", value=f"{latency_ms} ms", inline=True)
+    embed.add_field(name="Calisma suresi", value=format_uptime(uptime_seconds), inline=True)
+    embed.add_field(name="Sunucu sayisi", value=str(len(client.guilds)), inline=True)
+    embed.add_field(name="Toplam takip edilen yayinci", value=str(total_streamers), inline=True)
+    embed.add_field(name="Toplam kayitli kullanici", value=str(total_registrations), inline=True)
+    embed.add_field(name="Kick kontrol araligi", value=f"{CHECK_INTERVAL_SECONDS} sn", inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="yedekkanaliayarla", description="Restart oncesi otomatik yedeklerin (yayinci listesi + streak) gonderilecegi kanali secer")
+@app_commands.describe(kanal="Yedek dosyasinin gonderilecegi metin kanali")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def yedekkanaliayarla(interaction: discord.Interaction, kanal: discord.TextChannel):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    entry["backup_channel_id"] = kanal.id
+    save_data(data)
+    await interaction.response.send_message(f"Yedek kanali {kanal.mention} olarak ayarlandi.", ephemeral=True)
+
+
+@tree.command(name="logekle", description="Onceden alinmis bir yedek (.json) dosyasini geri yukler")
+@app_commands.describe(dosya="Yedek JSON dosyasi (restart sirasinda otomatik atilan dosya)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def logekle(interaction: discord.Interaction, dosya: discord.Attachment):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if not dosya.filename.lower().endswith(".json"):
+        await interaction.followup.send("Lutfen bir `.json` dosyasi yukle.", ephemeral=True)
+        return
+
+    try:
+        raw_bytes = await dosya.read()
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except Exception as e:
+        await interaction.followup.send(f"Dosya okunamadi ya da gecerli bir JSON degil: {e}", ephemeral=True)
+        return
+
+    streamers = payload.get("streamers")
+    streaks = payload.get("streaks")
+
+    if streamers is None and streaks is None:
+        await interaction.followup.send(
+            "Bu dosya beklenen formatta degil (icinde 'streamers' ya da 'streaks' bulunamadi).",
+            ephemeral=True,
+        )
+        return
+
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+
+    eklenen_yayinci = 0
+    if streamers is not None:
+        entry["streamers"] = streamers
+        eklenen_yayinci = len(streamers)
+
+    eklenen_streak = 0
+    if streaks is not None:
+        entry["streaks"] = streaks
+        eklenen_streak = len(streaks)
+
+    save_data(data)
+
+    await interaction.followup.send(
+        f"✅ **Yedek geri yuklendi!**\n"
+        f"- {eklenen_yayinci} yayinci\n"
+        f"- {eklenen_streak} kullanicinin streak verisi\n\n"
+        f"Yedek tarihi: {payload.get('exported_at', 'bilinmiyor')}",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="aiyesor", description="Sorunu Gemini AI'ya sorar ve cevabini gonderir")
+@app_commands.describe(soru="Sormak istedigin soru")
+async def aiyesor(interaction: discord.Interaction, soru: str):
+    await interaction.response.send_message(f"🤖 **Gemini'ye soruluyor...**\n`[░░░░░░░░░░]` 0%\n> {soru}")
+    msg = await interaction.original_response()
+
+    progress_task = asyncio.create_task(_animate_progress_bar(msg, soru))
+
+    try:
+        answer = await ask_gemini(soru)
+    except Exception as e:
+        progress_task.cancel()
+        await msg.edit(content=f"❌ **Hata olustu:** {e}")
+        return
+
+    progress_task.cancel()
+
+    if len(answer) > 1800:
+        file_obj = discord.File(io.BytesIO(answer.encode("utf-8")), filename="cevap.txt")
+        try:
+            await msg.edit(
+                content=f"✅ **Cevap hazir!**\n> {soru}\n\nCevap uzun oldugu icin dosya olarak ekledim.",
+                attachments=[file_obj],
+            )
+        except discord.DiscordException as e:
+            print(f"[HATA] Cevap mesaji guncellenemedi: {e}")
+    else:
+        try:
+            await msg.edit(content=f"✅ **Cevap hazir!**\n> {soru}\n\n{answer}")
+        except discord.DiscordException as e:
+            print(f"[HATA] Cevap mesaji guncellenemedi: {e}")
+
+
+@tree.command(name="yenidenbaslat", description="(SADECE YETKILILER) Botu yeniden baslatir")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def yenidenbaslat(interaction: discord.Interaction):
+    await interaction.response.send_message("🔄 **Yeniden baslatma talebi alindi...**")
+    msg = await interaction.original_response()
+
+    await asyncio.sleep(1.5)
+    await msg.edit(content="⏳ **Aktif gorevler durduruluyor...** (Kick kontrol dongusu vb.)")
+
+    await asyncio.sleep(1.5)
+    await msg.edit(content="📦 **Yedek olusturuluyor...** (yayinci listesi + streak verileri)")
+
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    backup_channel_id = entry.get("backup_channel_id")
+
+    if backup_channel_id:
+        backup_channel = client.get_channel(backup_channel_id)
+        if backup_channel is not None:
+            payload = build_backup_payload(entry)
+            backup_json = json.dumps(payload, ensure_ascii=False, indent=2)
+            backup_file = discord.File(
+                io.BytesIO(backup_json.encode("utf-8")),
+                filename=f"yedek_{interaction.guild_id}.json",
+            )
+            try:
+                await backup_channel.send(
+                    content=(
+                        "📦 **Otomatik yedek** (restart oncesi)\n"
+                        "Geri yuklemek istersen bu dosyayi indirip `/logekle` komutuna ekle."
+                    ),
+                    file=backup_file,
+                )
+            except discord.DiscordException as e:
+                print(f"[HATA] Yedek gonderilemedi: {e}")
+        else:
+            print("[UYARI] Yedek kanali bulunamadi, otomatik yedek atlaniyor.")
+    else:
+        print("[UYARI] Yedek kanali ayarlanmamis (/yedekkanaliayarla), otomatik yedek atlaniyor.")
+
+    await asyncio.sleep(1)
+    await msg.edit(content="💾 **Veriler kontrol ediliyor...** (kayitli veriler zaten her islemde otomatik kaydediliyor)")
+
+    await asyncio.sleep(1.5)
+    await msg.edit(content="🔌 **Bot kapatiliyor...** Birkac saniye icinde geri donecek, lutfen bekle.")
+
+    # Bot tekrar acilinca bu mesaji "basariyla acildi" diye guncelleyebilmesi
+    # icin hangi mesaj oldugunu diske kaydediyoruz.
+    save_restart_state(msg.channel.id, msg.id)
+
+    await asyncio.sleep(1)
+    print(f"[BILGI] /yenidenbaslat komutu {interaction.user} tarafindan calistirildi. Process sonlandiriliyor.")
+
+    # Process'i kasitli olarak (hata koduyla) sonlandiriyoruz. Railway'in
+    # "Restart Policy" ayari "On Failure" oldugu icin platform botu otomatik
+    # olarak yeniden baslatiyor. Bkz. README.
+    os._exit(1)
+
+
+# ------------------------------------------------------------------
+# Gunluk foto onay + streak sistemi
+# ------------------------------------------------------------------
+@tree.command(name="onaykanaliayarla", description="Gunluk fotograflarin onaya dusecegi kanali secer")
+@app_commands.describe(kanal="Fotograflarin Accept/Deny icin gonderilecegi metin kanali")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def onaykanaliayarla(interaction: discord.Interaction, kanal: discord.TextChannel):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    entry["photo_approval_channel_id"] = kanal.id
+    save_data(data)
+    await interaction.response.send_message(f"Foto onay kanali {kanal.mention} olarak ayarlandi.", ephemeral=True)
+
+
+def _can_approve(member: discord.Member) -> bool:
+    perms = member.guild_permissions
+    return perms.manage_guild or perms.manage_messages
+
+
+class DailyApprovalView(discord.ui.View):
+    """Onay kanalina dusen fotografin altindaki Accept/Deny butonlari.
+    NOT: Bot yeniden baslarsa (redeploy) bu view'lar kalici degildir,
+    o an bekleyen onaylar icin butonlar calismaz hale gelir - kucuk
+    olcekli kullanim icin kabul edilebilir bir sinir."""
+
+    def __init__(self, guild_id: int, target_user_id: int):
+        super().__init__(timeout=3600)  # 1 saat sonra butonlar pasif olur
+        self.guild_id = guild_id
+        self.target_user_id = target_user_id
+
+    async def _finalize(self, interaction: discord.Interaction, approved: bool):
+        for child in self.children:
+            child.disabled = True
+
+        embed = interaction.message.embeds[0]
+
+        if approved:
+            new_streak = update_streak(str(self.guild_id), str(self.target_user_id))
+            embed.color = 0x53FC18
+            embed.set_footer(text=f"✅ Onaylayan: {interaction.user} | Guncel seri: {new_streak} gun")
+        else:
+            embed.color = 0xFF5C5C
+            embed.set_footer(text=f"❌ Reddeden: {interaction.user}")
+
+        await interaction.response.edit_message(embed=embed, view=self)
+
+        member = interaction.guild.get_member(self.target_user_id)
+        if member is not None:
+            try:
+                if approved:
+                    await member.send(
+                        f"Gunluk fotografin onaylandi! 🎉 Guncel serin: **{new_streak} gun**"
+                    )
+                else:
+                    await member.send("Gunluk fotografin reddedildi. Istersen `/daily` ile tekrar deneyebilirsin.")
+            except discord.Forbidden:
+                pass  # kullanicinin DM'leri kapali
+
+    @discord.ui.button(label="Onayla", style=discord.ButtonStyle.success, emoji="✅")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _can_approve(interaction.user):
+            await interaction.response.send_message("Bu islemi yapmaya yetkin yok.", ephemeral=True)
+            return
+        await self._finalize(interaction, approved=True)
+
+    @discord.ui.button(label="Reddet", style=discord.ButtonStyle.danger, emoji="❌")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _can_approve(interaction.user):
+            await interaction.response.send_message("Bu islemi yapmaya yetkin yok.", ephemeral=True)
+            return
+        await self._finalize(interaction, approved=False)
+
+
+@tree.command(name="daily", description="Gunluk foto streak'in icin fotograf gonder")
+async def daily(interaction: discord.Interaction):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    approval_channel_id = entry.get("photo_approval_channel_id")
+
+    if not approval_channel_id:
+        await interaction.response.send_message(
+            "Foto onay kanali ayarlanmamis. Bir yetkili once `/onaykanaliayarla` ile ayarlamali.",
+            ephemeral=True,
+        )
+        return
+
+    approval_channel = client.get_channel(approval_channel_id)
+    if approval_channel is None:
+        await interaction.response.send_message("Onay kanali bulunamadi, bir yetkiliye haber ver.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"{interaction.user.mention} Lutfen **{DAILY_WAIT_SECONDS} saniye** icinde "
+        f"bu kanala bugunku fotografini gonder! 📸"
+    )
+
+    def check(m: discord.Message):
+        return (
+            m.author.id == interaction.user.id
+            and m.channel.id == interaction.channel.id
+            and len(m.attachments) > 0
+        )
+
+    try:
+        msg = await client.wait_for("message", check=check, timeout=DAILY_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            f"{interaction.user.mention} Sure doldu, fotograf gelmedi. Tekrar `/daily` yazabilirsin.",
+            ephemeral=True,
+        )
+        return
+
+    attachment = msg.attachments[0]
+    if not (attachment.content_type or "").startswith("image/"):
+        await interaction.followup.send(
+            "Gonderdigin dosya bir resme benzemiyor, tekrar `/daily` yazip bir resim gonder.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="Gunluk Foto Onayi Bekleniyor",
+        description=f"Gonderen: {interaction.user.mention} (`{interaction.user.id}`)",
+        color=0xFFB454,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_image(url=attachment.url)
+    embed.set_footer(text="Yetkili biri Onayla/Reddet basana kadar bekliyor")
+
+    view = DailyApprovalView(guild_id=interaction.guild_id, target_user_id=interaction.user.id)
+
+    try:
+        await approval_channel.send(embed=embed, view=view)
+    except discord.DiscordException as e:
+        await interaction.followup.send(f"Fotograf onay kanaline gonderilemedi: {e}", ephemeral=True)
+        return
+
+    try:
+        await msg.add_reaction("📨")
+    except discord.DiscordException:
+        pass
+
+    await interaction.followup.send("Fotografin onaya gonderildi, sonucu DM'den ogreneceksin! 📨", ephemeral=True)
+
+
+@tree.command(name="streak", description="Gunluk foto serini gosterir")
+async def streak_command(interaction: discord.Interaction):
+    data = load_data()
+    entry = get_guild_entry(data, str(interaction.guild_id))
+    user_streak = entry.get("streaks", {}).get(str(interaction.user.id), {"streak": 0, "last_date": None})
+    streak_count = user_streak.get("streak", 0)
+
+    if streak_count == 0:
+        await interaction.response.send_message("Henuz bir serin yok. `/daily` ile baslat! 📸", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"🔥 Guncel serin: **{streak_count} gun**\n(Son onaylanan: {user_streak.get('last_date')})",
+        ephemeral=True,
+    )
+
+
+# ------------------------------------------------------------------
+# Kayit sistemi (isim, yas, Roblox kullanici adi)
+# ------------------------------------------------------------------
+class RegistrationModal(discord.ui.Modal, title="🎮 Sunucu Kaydı"):
+    isim = discord.ui.TextInput(label="Adın", placeholder="Örn: Alperen", max_length=40)
+    yas = discord.ui.TextInput(label="Yaşın", placeholder="Örn: 16", max_length=3)
+    roblox_kullanici_adi = discord.ui.TextInput(label="Roblox kullanıcı adın", placeholder="Sadece kullanıcı adı", max_length=30)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            yas_int = int(str(self.yas.value).strip())
+        except ValueError:
+            await interaction.followup.send("❌ Yaş alanına sadece sayı yazmalısın.", ephemeral=True)
+            return
+        if not 1 <= yas_int <= 120:
+            await interaction.followup.send("❌ Geçerli bir yaş gir.", ephemeral=True)
+            return
+        try:
+            roblox_user = await get_roblox_user(str(self.roblox_kullanici_adi.value).strip())
+        except Exception as e:
+            await interaction.followup.send(f"❌ Roblox bilgisi alınamadı: {e}", ephemeral=True)
+            return
+        if not roblox_user:
+            await interaction.followup.send(f"❌ **{self.roblox_kullanici_adi.value}** adında bir Roblox kullanıcısı bulunamadı.", ephemeral=True)
+            return
+        data = load_data()
+        entry = get_guild_entry(data, str(interaction.guild_id))
+        entry.setdefault("registrations", {})[str(interaction.user.id)] = {
+            "isim": str(self.isim.value).strip(), "yas": yas_int,
+            "roblox_username": roblox_user["username"], "roblox_id": roblox_user["id"],
+            "kayit_tarihi": datetime.now(timezone.utc).isoformat(),
+        }
+        save_data(data)
+        embed = discord.Embed(title="✅ Kayıt Başarıyla Tamamlandı", description=f"Hoş geldin **{self.isim.value.strip()}**! Kayıt bilgilerin sisteme işlendi.", color=0x53FC18, timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="👤 İsim", value=self.isim.value.strip(), inline=True)
+        embed.add_field(name="🎂 Yaş", value=str(yas_int), inline=True)
+        embed.add_field(name="🎮 Roblox", value=roblox_user["username"], inline=True)
+        if roblox_user.get("thumbnail_url"):
+            embed.set_thumbnail(url=roblox_user["thumbnail_url"])
+        embed.add_field(name="🔗 Roblox profili", value=roblox_user["profile_url"], inline=False)
+        embed.set_footer(text="Kayıt sistemi • Değiştirmek için /kayit komutunu tekrar kullanabilirsin.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="kayit", description="🎮 Sunucu kayıt formunu açar")
+async def kayit(interaction: discord.Interaction):
+    await interaction.response.send_modal(RegistrationModal())
+
+
+@tree.command(
+    name="kesiftest",
+    description="(DENEYSEL) Bir Kick kanalinin chat'inde ban/timeout sinyali yayinlanip yayinlanmadigini test eder",
+)
+@app_commands.describe(
+    kullanici_adi="Test edilecek Kick kullanici adi (moderatoru olman gerekmiyor)",
+    sure_saniye="Kac saniye dinlensin (varsayilan 120, en fazla 240)",
+    chatroom_id="Otomatik bulma basarisiz olursa elle girebilecegin chatroom ID (opsiyonel)",
+)
+async def kesiftest(
+    interaction: discord.Interaction,
+    kullanici_adi: str,
+    sure_saniye: int = 120,
+    chatroom_id: str = None,
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    slug = kullanici_adi.strip().lower()
+    duration = max(30, min(sure_saniye, 240))
+
+    resolved_id = chatroom_id
+    if not resolved_id:
+        try:
+            resolved_id = await resolve_chatroom_id(slug)
+        except Exception as e:
+            await interaction.followup.send(
+                f"Kanal bilgisi otomatik alinamadi ({e}). Kick'in koruma sistemi "
+                f"engellemis olabilir. Chatroom ID'yi tarayicidan bulup "
+                f"`chatroom_id` parametresiyle tekrar dene:\n"
+                f"1) `kick.com/api/v2/channels/{slug}` adresini tarayicidan ac\n"
+                f'2) Icinde `"chatroom":{{"id": SAYI` seklinde bir alan ara\n'
+                f"3) O sayiyi `/kesiftest kullanici_adi:{slug} chatroom_id:SAYI` "
+                f"seklinde tekrar gonder",
+                ephemeral=True,
+            )
+            return
+
+    if not resolved_id:
+        await interaction.followup.send(
+            "Chatroom ID bulunamadi. Kullanici adini kontrol et ya da "
+            "`chatroom_id` parametresiyle elle gir.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"**{slug}** kanalinin chat'i **{duration} saniye** boyunca dinleniyor "
+        f"(chatroom_id: `{resolved_id}`). Sonuc birazdan burada.",
+        ephemeral=True,
+    )
+
+    found_events, error = await listen_for_unknown_events(int(resolved_id), duration)
+
+    if error:
+        await interaction.followup.send(f"Baglanti hatasi olustu: {error}", ephemeral=True)
+        return
+
+    if not found_events:
+        await interaction.followup.send(
+            "**Test bitti.** Bilinmeyen (potansiyel ban/timeout) bir event yakalanmadi.",
+            ephemeral=True,
+        )
+        return
+
+    report = json.dumps(found_events, indent=2, ensure_ascii=False)
+    file_obj = discord.File(io.BytesIO(report.encode("utf-8")), filename=f"{slug}_kesif_sonuclari.json")
+
+    await interaction.followup.send(
+        f"**{len(found_events)} bilinmeyen event yakalandi!** Detaylar ekli dosyada.",
+        file=file_obj,
+        ephemeral=True,
+    )
+
+
+# ------------------------------------------------------------------
+# Yeni sistemler: ticket / emoji rol / cekilis / bot korumasi / bot kapani
+# ------------------------------------------------------------------
+
+def get_feature_entry(guild_id: int):
+    data = load_data()
+    entry = get_guild_entry(data, str(guild_id))
+    return data, entry
+
+
+def is_staff(member: discord.Member) -> bool:
+    return member.guild_permissions.manage_guild or member.guild_permissions.manage_channels
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎫 Destek Talebi Aç", style=discord.ButtonStyle.primary, custom_id="kingo:ticket_open")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data, entry = get_feature_entry(interaction.guild_id)
+        category = interaction.guild.get_channel(entry.get("ticket_category_id")) if entry.get("ticket_category_id") else None
+        support_role = interaction.guild.get_role(entry.get("ticket_support_role_id")) if entry.get("ticket_support_role_id") else None
+        existing_id = entry.get("open_tickets", {}).get(str(interaction.user.id))
+        if existing_id:
+            existing = interaction.guild.get_channel(existing_id)
+            if existing:
+                await interaction.response.send_message(f"Zaten açık bir ticket'ın var: {existing.mention}", ephemeral=True)
+                return
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+            interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
+        }
+        if support_role:
+            overwrites[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        try:
+            channel = await interaction.guild.create_text_channel(
+                name=f"ticket-{interaction.user.name.lower()[:18]}",
+                category=category if isinstance(category, discord.CategoryChannel) else None,
+                overwrites=overwrites,
+                reason=f"Ticket açıldı: {interaction.user}",
+            )
+        except discord.DiscordException as e:
+            await interaction.response.send_message(f"❌ Ticket oluşturulamadı: {e}", ephemeral=True)
+            return
+        entry.setdefault("open_tickets", {})[str(interaction.user.id)] = channel.id
+        save_data(data)
+        embed = discord.Embed(
+            title="🎫 Destek Talebin Açıldı",
+            description=f"Merhaba {interaction.user.mention}! Yetkili ekip birazdan ilgilenecek.\n\nSorununu detaylı anlat. Ticket'ı kapatmak için aşağıdaki butonu kullanabilirsin.",
+            color=0x5865F2, timestamp=datetime.now(timezone.utc),
+        )
+        await channel.send(content=interaction.user.mention, embed=embed, view=TicketCloseView())
+        await interaction.response.send_message(f"✅ Ticket oluşturuldu: {channel.mention}", ephemeral=True)
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔒 Ticket'ı Kapat", style=discord.ButtonStyle.danger, custom_id="kingo:ticket_close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data, entry = get_feature_entry(interaction.guild_id)
+        owner_id = next((uid for uid, cid in entry.get("open_tickets", {}).items() if cid == interaction.channel.id), None)
+        if not is_staff(interaction.user) and owner_id != str(interaction.user.id):
+            await interaction.response.send_message("❌ Bu ticket'ı kapatmaya yetkin yok.", ephemeral=True)
+            return
+        if owner_id:
+            entry["open_tickets"].pop(owner_id, None)
+            save_data(data)
+        await interaction.response.send_message("🔒 Ticket kapatılıyor...", ephemeral=True)
+        await asyncio.sleep(1)
+        try:
+            await interaction.channel.delete(reason=f"Ticket kapatıldı: {interaction.user}")
+        except discord.DiscordException:
+            pass
+
+
+@tree.command(name="ticketkur", description="🎫 Ticket panelini kurar")
+@app_commands.describe(kanal="Ticket butonunun gönderileceği kanal")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticketkur(interaction: discord.Interaction, kanal: discord.TextChannel):
+    data, entry = get_feature_entry(interaction.guild_id)
+    entry["ticket_channel_id"] = kanal.id
+    save_data(data)
+    embed = discord.Embed(
+        title="🎫 Destek Merkezi",
+        description="Bir sorun, yardım talebi veya yönetim isteğin varsa aşağıdaki butona basarak özel bir ticket oluşturabilirsin.",
+        color=0x5865F2,
+    )
+    embed.set_footer(text="Kingo • Destek Sistemi")
+    await kanal.send(embed=embed, view=TicketPanelView())
+    await interaction.response.send_message(f"✅ Ticket paneli {kanal.mention} kanalına kuruldu.", ephemeral=True)
+
+
+@tree.command(name="ticketayarlari", description="🎫 Ticket kategori ve yetkili rolünü ayarlar")
+@app_commands.describe(kategori="Ticketların açılacağı kategori", yetkili_rol="Ticketları görecek yetkili rolü")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticketayarlari(interaction: discord.Interaction, kategori: discord.CategoryChannel, yetkili_rol: discord.Role = None):
+    data, entry = get_feature_entry(interaction.guild_id)
+    entry["ticket_category_id"] = kategori.id
+    entry["ticket_support_role_id"] = yetkili_rol.id if yetkili_rol else None
+    save_data(data)
+    await interaction.response.send_message(f"✅ Ticket kategorisi: **{kategori.name}**\n👮 Yetkili rolü: {yetkili_rol.mention if yetkili_rol else 'ayarlanmadı'}", ephemeral=True)
+
+
+@tree.command(name="rolmesaji", description="🎭 Emoji ile rol verme mesajı oluşturur")
+@app_commands.describe(kanal="Mesajın gönderileceği kanal", emoji="Kullanılacak emoji", rol="Emojiye basınca verilecek rol", baslik="Mesaj başlığı")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def rolmesaji(interaction: discord.Interaction, kanal: discord.TextChannel, emoji: str, rol: discord.Role, baslik: str = "🎭 Rolünü Seç"):
+    embed = discord.Embed(
+        title=baslik,
+        description=f"{emoji} tepkisine basarak {rol.mention} rolünü alabilirsin.\nTekrar basarsan rol kaldırılır.",
+        color=0x9B59B6,
+    )
+    embed.set_footer(text="Kingo • Emoji Rol Sistemi")
+    msg = await kanal.send(embed=embed)
+    try:
+        await msg.add_reaction(emoji)
+    except discord.DiscordException:
+        await msg.delete()
+        await interaction.response.send_message("❌ Bu emoji kullanılamadı. Geçerli bir emoji gir.", ephemeral=True)
+        return
+    data, entry = get_feature_entry(interaction.guild_id)
+    entry.setdefault("reaction_roles", {}).setdefault(str(msg.id), {})[emoji] = rol.id
+    save_data(data)
+    await interaction.response.send_message(f"✅ Rol mesajı oluşturuldu: {msg.jump_url}", ephemeral=True)
+
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.guild_id is None or payload.member is None or payload.member.bot:
+        return
+    data, entry = get_feature_entry(payload.guild_id)
+    role_id = entry.get("reaction_roles", {}).get(str(payload.message_id), {}).get(str(payload.emoji))
+    if not role_id:
+        return
+    role = payload.member.guild.get_role(role_id)
+    if role and payload.member.guild.me and role < payload.member.guild.me.top_role:
+        try:
+            await payload.member.add_roles(role, reason="Emoji rol sistemi")
+        except discord.DiscordException:
+            pass
+
+
+@client.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if payload.guild_id is None:
+        return
+    data, entry = get_feature_entry(payload.guild_id)
+    role_id = entry.get("reaction_roles", {}).get(str(payload.message_id), {}).get(str(payload.emoji))
+    if not role_id:
+        return
+    guild = client.get_guild(payload.guild_id)
+    if not guild:
+        return
+    member = guild.get_member(payload.user_id)
+    role = guild.get_role(role_id)
+    if member and role and guild.me and role < guild.me.top_role:
+        try:
+            await member.remove_roles(role, reason="Emoji rol sistemi")
+        except discord.DiscordException:
+            pass
+
+
+@tree.command(name="cekilis", description="🎉 Belirtilen sürede çekiliş başlatır")
+@app_commands.describe(kanal="Çekiliş kanalı", sure_saniye="Süre (saniye)", kazanan_sayisi="Kazanan sayısı", odul="Çekiliş ödülü")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def cekilis(interaction: discord.Interaction, kanal: discord.TextChannel, sure_saniye: int, kazanan_sayisi: int, odul: str):
+    if sure_saniye < 10 or sure_saniye > 31_536_000 or kazanan_sayisi < 1 or kazanan_sayisi > 50:
+        await interaction.response.send_message("❌ Süre 10 sn-365 gün, kazanan sayısı 1-50 arasında olmalı.", ephemeral=True)
+        return
+    end_at = datetime.now(timezone.utc) + timedelta(seconds=sure_saniye)
+    embed = discord.Embed(
+        title="🎉 ÇEKİLİŞ BAŞLADI!",
+        description=f"🎁 **Ödül:** {odul}\n\n👥 **Kazanan:** {kazanan_sayisi}\n⏰ **Bitiş:** {discord.utils.format_dt(end_at, style='R')}\n\nKatılmak için **🎉** tepkisine bas!",
+        color=0xF1C40F, timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="Kingo • Çekiliş Sistemi")
+    msg = await kanal.send(embed=embed)
+    await msg.add_reaction("🎉")
+    data, entry = get_feature_entry(interaction.guild_id)
+    entry.setdefault("giveaways", {})[str(msg.id)] = {
+        "channel_id": kanal.id, "end_at": end_at.timestamp(), "winner_count": kazanan_sayisi,
+        "prize": odul, "host_id": interaction.user.id,
+    }
+    save_data(data)
+    await interaction.response.send_message(f"✅ Çekiliş başlatıldı: {msg.jump_url}", ephemeral=True)
+
+
+async def finish_giveaway(guild_id: str, message_id: str, giveaway: dict):
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return
+    channel = guild.get_channel(giveaway.get("channel_id"))
+    if not channel:
+        return
+    try:
+        msg = await channel.fetch_message(int(message_id))
+    except discord.DiscordException:
+        return
+    reaction = next((r for r in msg.reactions if str(r.emoji) == "🎉"), None)
+    users = []
+    if reaction:
+        try:
+            users = [u async for u in reaction.users() if not u.bot]
+        except discord.DiscordException:
+            users = []
+    winners = random.sample(users, min(len(users), giveaway.get("winner_count", 1))) if users else []
+    if winners:
+        result = f"🎉 **Çekiliş bitti!**\n🎁 Ödül: **{giveaway.get('prize', 'Bilinmiyor')}**\n🏆 Kazananlar: {', '.join(u.mention for u in winners)}"
+    else:
+        result = f"🎉 **Çekiliş bitti!**\n🎁 Ödül: **{giveaway.get('prize', 'Bilinmiyor')}**\n😕 Yeterli katılım olmadığı için kazanan çıkmadı."
+    try:
+        await channel.send(result)
+    except discord.DiscordException:
+        pass
+    try:
+        embed = msg.embeds[0]
+        embed.title = "🎉 ÇEKİLİŞ SONA ERDİ"
+        embed.color = 0x95A5A6
+        embed.set_footer(text="Kingo • Çekiliş tamamlandı")
+        await msg.edit(embed=embed)
+    except discord.DiscordException:
+        pass
+
+
+@tasks.loop(seconds=10)
+async def giveaway_loop():
+    data = load_data()
+    changed = False
+    now = time.time()
+    for guild_id, entry in data.items():
+        giveaways = entry.get("giveaways", {})
+        for message_id, giveaway in list(giveaways.items()):
+            if giveaway.get("end_at", 0) <= now:
+                await finish_giveaway(guild_id, message_id, giveaway)
+                giveaways.pop(message_id, None)
+                changed = True
+    if changed:
+        save_data(data)
+
+
+@giveaway_loop.before_loop
+async def before_giveaway_loop():
+    await client.wait_until_ready()
+
+
+@tree.command(name="botkoruma", description="🛡️ Bot/raid korumasını ayarlar")
+@app_commands.describe(aktif="Koruma aktif mi?", minimum_hesap_yasi="Yeni hesaplar için minimum yaş (gün)", raid_esigi="Bu süredeki katılım sayısı", raid_suresi="Katılım penceresi (saniye)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def botkoruma(interaction: discord.Interaction, aktif: bool, minimum_hesap_yasi: int = 3, raid_esigi: int = 5, raid_suresi: int = 20):
+    if minimum_hesap_yasi < 0 or minimum_hesap_yasi > 3650 or raid_esigi < 2 or raid_esigi > 100 or raid_suresi < 5 or raid_suresi > 300:
+        await interaction.response.send_message("❌ Ayarlar geçersiz. Hesap yaşı 0-3650, raid eşiği 2-100, pencere 5-300 saniye olmalı.", ephemeral=True)
+        return
+    data, entry = get_feature_entry(interaction.guild_id)
+    entry["bot_protection"] = {"enabled": aktif, "min_account_age_days": minimum_hesap_yasi, "raid_threshold": raid_esigi, "raid_window_seconds": raid_suresi}
+    save_data(data)
+    await interaction.response.send_message(f"🛡️ Bot koruması **{'aktif' if aktif else 'kapalı'}**. Şüpheli hesaplara otomatik timeout uygulanır; ban atılmaz.", ephemeral=True)
+
+
+@tree.command(name="botkanaliayarla", description="🪤 Görsel kapanı kanalını ayarlar")
+@app_commands.describe(kanal="Görsel atıldığında otomatik timeout uygulanacak kanal")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def botkanaliayarla(interaction: discord.Interaction, kanal: discord.TextChannel):
+    data, entry = get_feature_entry(interaction.guild_id)
+    entry["trap_channel_id"] = kanal.id
+    save_data(data)
+    await interaction.response.send_message(f"🪤 Görsel kapanı {kanal.mention} olarak ayarlandı. Bu kanalda görsel paylaşan normal kullanıcılar timeout'a alınır.", ephemeral=True)
+
+
+async def apply_indefinite_timeout(member: discord.Member, reason: str):
+    if member.bot or member.guild_permissions.administrator or not member.guild.me.guild_permissions.moderate_members:
+        return False
+    try:
+        await member.timeout(datetime.now(timezone.utc) + timedelta(days=TRAP_TIMEOUT_DAYS), reason=reason)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
+@tasks.loop(hours=20)
+async def trap_timeout_loop():
+    data = load_data()
+    changed = False
+    for guild_id, entry in data.items():
+        for user_id in list(entry.get("trap_users", {}).keys()):
+            guild = client.get_guild(int(guild_id))
+            if not guild:
+                continue
+            member = guild.get_member(int(user_id))
+            if member is None:
+                entry["trap_users"].pop(user_id, None)
+                changed = True
+                continue
+            await apply_indefinite_timeout(member, "🪤 Görsel kapanı: timeout yenileme")
+    if changed:
+        save_data(data)
+
+
+@trap_timeout_loop.before_loop
+async def before_trap_timeout_loop():
+    await client.wait_until_ready()
+# ------------------------------------------------------------------
+# Ban / unban loglama
+# ------------------------------------------------------------------
+@client.event
+async def on_member_ban(guild: discord.Guild, user):
+    data = load_data()
+    entry = get_guild_entry(data, str(guild.id))
+    save_data(data)
+
+    audit_entry = await find_audit_log_entry(guild, discord.AuditLogAction.ban, user.id)
+    moderator = audit_entry.user if audit_entry else None
+    reason = audit_entry.reason if audit_entry else None
+
+    embed = discord.Embed(
+        title="Uye banlandi",
+        description=f"{user} (`{user.id}`)",
+        color=0xFF5C5C,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="Banlayan", value=str(moderator) if moderator else "Bilinmiyor", inline=True)
+    embed.add_field(name="Sebep", value=reason or "Belirtilmemis", inline=False)
+
+    await send_log_embed(entry, embed)
+
+
+@client.event
+async def on_member_unban(guild: discord.Guild, user):
+    data = load_data()
+    entry = get_guild_entry(data, str(guild.id))
+    save_data(data)
+
+    audit_entry = await find_audit_log_entry(guild, discord.AuditLogAction.unban, user.id)
+    moderator = audit_entry.user if audit_entry else None
+
+    embed = discord.Embed(
+        title="Uyenin banı kaldirildi",
+        description=f"{user} (`{user.id}`)",
+        color=0x53FC18,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="Kaldiran", value=str(moderator) if moderator else "Bilinmiyor", inline=True)
+
+    await send_log_embed(entry, embed)
+
+
+# ------------------------------------------------------------------
+# Timeout loglama (Discord'un kendi zaman asimi ozelligi)
+# ------------------------------------------------------------------
+@client.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if before.timed_out_until == after.timed_out_until:
+        return
+
+    data = load_data()
+    entry = get_guild_entry(data, str(after.guild.id))
+    save_data(data)
+
+    now = datetime.now(timezone.utc)
+    is_new_timeout = after.timed_out_until is not None and after.timed_out_until > now
+
+    audit_entry = await find_audit_log_entry(after.guild, discord.AuditLogAction.member_update, after.id)
+    moderator = audit_entry.user if audit_entry else None
+
+    if is_new_timeout:
+        embed = discord.Embed(
+            title="Uyeye zaman asimi (timeout) verildi",
+            description=f"{after} (`{after.id}`)",
+            color=0xFFB454,
+            timestamp=now,
+        )
+        embed.set_thumbnail(url=after.display_avatar.url)
+        embed.add_field(name="Bitis", value=discord.utils.format_dt(after.timed_out_until, style="R"), inline=True)
+        embed.add_field(name="Veren", value=str(moderator) if moderator else "Bilinmiyor", inline=True)
+    else:
+        embed = discord.Embed(
+            title="Uyenin zaman asimi kaldirildi",
+            description=f"{after} (`{after.id}`)",
+            color=0x53FC18,
+            timestamp=now,
+        )
+        embed.set_thumbnail(url=after.display_avatar.url)
+        embed.add_field(name="Kaldiran", value=str(moderator) if moderator else "Bilinmiyor / suresi doldu", inline=True)
+
+    await send_log_embed(entry, embed)
+
+
+# ------------------------------------------------------------------
+# Katilma / ayrilma / kick loglama + hos geldin + otomatik rol
+# ------------------------------------------------------------------
+@client.event
+async def on_member_join(member: discord.Member):
+    data, entry = get_feature_entry(member.guild.id)
+    now = datetime.now(timezone.utc)
+    protection = entry.get("bot_protection") or {}
+    recent = [t for t in entry.get("recent_joins", []) if now.timestamp() - t <= protection.get("raid_window_seconds", 20)]
+    recent.append(now.timestamp())
+    entry["recent_joins"] = recent[-200:]
+    if protection.get("enabled") and not member.bot and not member.guild_permissions.administrator:
+        account_age_days = (now - member.created_at).total_seconds() / 86400
+        raid_active = len(recent) >= protection.get("raid_threshold", 5)
+        too_new = account_age_days < protection.get("min_account_age_days", 3)
+        if too_new or raid_active:
+            reason = "🛡️ Bot koruması: " + (f"hesap yaşı {account_age_days:.1f} gün" if too_new else f"raid penceresinde {len(recent)} katılım")
+            if raid_active and too_new:
+                reason += ", raid dalgası"
+            await apply_indefinite_timeout(member, reason)
+    welcome_channel_id = entry.get("welcome_channel_id")
+    if welcome_channel_id:
+        channel = client.get_channel(welcome_channel_id)
+        if channel is not None:
+            description = (
+                f"🎉 **{member.mention}**, **{member.guild.name}** ailesine hoş geldin!"
+                + chr(10) + chr(10)
+                + "━━━━━━━━━━━━━━━━━━━━" + chr(10)
+                + "👋 Kurallara göz atmayı unutma." + chr(10)
+                + "🎮 Keyifli vakit geçir, iyi eğlenceler!" + chr(10)
+                + "🎫 Yardım için ticket sistemini kullanabilirsin." + chr(10)
+                + "━━━━━━━━━━━━━━━━━━━━"
+            )
+            embed = discord.Embed(title="✨ ARAMIZA HOŞ GELDİN! ✨", description=description, color=0x53FC18, timestamp=now)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.set_footer(text=f"🌟 Aramıza katılan: {member.guild.member_count}. üye")
+            try:
+                await channel.send(content=f"🎊 {member.mention}", embed=embed)
+            except discord.DiscordException as e:
+                print(f"[HATA] Hoş geldin mesajı gönderilemedi: {e}")
+    auto_role_id = entry.get("auto_role_id")
+    if auto_role_id:
+        role = member.guild.get_role(auto_role_id)
+        if role is not None:
+            try:
+                await member.add_roles(role, reason="Otomatik rol atama")
+            except discord.DiscordException as e:
+                print(f"[HATA] Otomatik rol verilemedi: {e}")
+    embed = discord.Embed(description=f"📥 {member} (`{member.id}`) sunucuya katıldı.", color=0x53FC18, timestamp=now)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    await send_log_embed(entry, embed)
+    save_data(data)
+
+
+@client.event
+async def on_member_remove(member: discord.Member):
+    data = load_data()
+    entry = get_guild_entry(data, str(member.guild.id))
+    save_data(data)
+
+    audit_entry = await find_audit_log_entry(member.guild, discord.AuditLogAction.kick, member.id)
+    now = datetime.now(timezone.utc)
+
+    is_recent_kick = (
+        audit_entry is not None
+        and (now - audit_entry.created_at).total_seconds() < 10
+    )
+
+    if is_recent_kick:
+        embed = discord.Embed(
+            title="Uye sunucudan atildi (kick)",
+            description=f"{member} (`{member.id}`)",
+            color=0xFF9F43,
+            timestamp=now,
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="Atan", value=str(audit_entry.user), inline=True)
+        embed.add_field(name="Sebep", value=audit_entry.reason or "Belirtilmemis", inline=False)
+    else:
+        embed = discord.Embed(
+            description=f"📤 {member} (`{member.id}`) sunucudan ayrildi.",
+            color=0x6B726C,
+            timestamp=now,
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+    await send_log_embed(entry, embed)
+
+
+# ------------------------------------------------------------------
+# Mesaj silme / duzenleme loglama
+# ------------------------------------------------------------------
+@client.event
+async def on_message_delete(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    data = load_data()
+    entry = get_guild_entry(data, str(message.guild.id))
+    save_data(data)
+
+    log_channel_id = entry.get("log_channel_id")
+    if not log_channel_id or log_channel_id == message.channel.id:
+        return
+
+    content = message.content or "*(metin yok - resim/dosya olabilir)*"
+    if len(content) > 1000:
+        content = content[:1000] + "..."
+
+    embed = discord.Embed(
+        title="Mesaj silindi",
+        description=f"**Kanal:** {message.channel.mention}\n**Yazan:** {message.author}",
+        color=0xFF5C5C,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Icerik", value=content, inline=False)
+
+    await send_log_embed(entry, embed)
+
+
+@client.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if before.author.bot or not before.guild or before.content == after.content:
+        return
+
+    data = load_data()
+    entry = get_guild_entry(data, str(before.guild.id))
+    save_data(data)
+
+    log_channel_id = entry.get("log_channel_id")
+    if not log_channel_id or log_channel_id == before.channel.id:
+        return
+
+    old_content = (before.content or "*(bos)*")[:500]
+    new_content = (after.content or "*(bos)*")[:500]
+
+    embed = discord.Embed(
+        title="Mesaj duzenlendi",
+        description=f"**Kanal:** {before.channel.mention}\n**Yazan:** {before.author}",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Eski hali", value=old_content, inline=False)
+    embed.add_field(name="Yeni hali", value=new_content, inline=False)
+
+    await send_log_embed(entry, embed)
+
+
+# ------------------------------------------------------------------
+# Ses kanali giris/cikis loglama
+# ------------------------------------------------------------------
+@client.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if before.channel == after.channel:
+        return
+
+    data = load_data()
+    entry = get_guild_entry(data, str(member.guild.id))
+    save_data(data)
+
+    if before.channel is None and after.channel is not None:
+        desc = f"🔊 {member} **{after.channel.name}** ses kanalina katildi."
+        color = 0x53FC18
+    elif before.channel is not None and after.channel is None:
+        desc = f"🔇 {member} **{before.channel.name}** ses kanalindan ayrildi."
+        color = 0x6B726C
+    else:
+        desc = f"🔀 {member} **{before.channel.name}** kanalindan **{after.channel.name}** kanalina gecti."
+        color = 0x5865F2
+
+    embed = discord.Embed(description=desc, color=color, timestamp=datetime.now(timezone.utc))
+    await send_log_embed(entry, embed)
+
+
+# ------------------------------------------------------------------
+# !user @kullanici - Discord + kayit + Roblox bilgisi ozet komutu
+# (slash komut degil, normal mesaj - sadece yetkililer kullanabilir)
+# ------------------------------------------------------------------
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+    data, entry = get_feature_entry(message.guild.id)
+    if entry.get("trap_channel_id") == message.channel.id and message.attachments:
+        has_image = any((a.content_type or "").startswith("image/") for a in message.attachments)
+        if has_image and not is_staff(message.author):
+            if await apply_indefinite_timeout(message.author, "🪤 Görsel kapanı tetiklendi"):
+                entry.setdefault("trap_users", {})[str(message.author.id)] = True
+                save_data(data)
+                try:
+                    await message.delete(reason="Görsel kapanı")
+                except discord.DiscordException:
+                    pass
+                try:
+                    await message.channel.send(f"🪤 {message.author.mention} görsel kapanına takıldı. Timeout uygulandı.", delete_after=8)
+                except discord.DiscordException:
+                    pass
+                return
+    if message.content.strip().lower().startswith("!user"):
+        await handle_user_lookup(message)
+
+
+async def handle_user_lookup(message: discord.Message):
+    if not _can_approve(message.author):
+        await message.reply("Bu komutu kullanma yetkin yok.", mention_author=False)
+        return
+
+    target = message.mentions[0] if message.mentions else None
+    if target is None:
+        await message.reply("Kullanim: `!user @kullanici`", mention_author=False)
+        return
+
+    data = load_data()
+    entry = get_guild_entry(data, str(message.guild.id))
+    registration = entry.get("registrations", {}).get(str(target.id))
+
+    now = datetime.now(timezone.utc)
+    account_age_days = (now - target.created_at).days
+    joined_days = (now - target.joined_at).days if getattr(target, "joined_at", None) else None
+
+    # Basit bir "guvenilirlik" TAHMINI - bu kesin bir dogruluk garantisi
+    # DEGIL, sadece birkac kaba isarete bakan bir ipucu.
+    guven_puani = 0
+    guven_notlari = []
+
+    if account_age_days >= 30:
+        guven_puani += 1
+    else:
+        guven_notlari.append("Discord hesabi 30 gunden yeni")
+
+    if target.avatar is not None:
+        guven_puani += 1
+    else:
+        guven_notlari.append("Profil fotografi yok (varsayilan avatar)")
+
+    if joined_days is None or (account_age_days - joined_days) > 1:
+        guven_puani += 1
+    else:
+        guven_notlari.append("Hesap, sunucuya katilmadan hemen once acilmis olabilir")
+
+    if guven_puani >= 3:
+        guven_metni = "🟢 Belirgin bir risk isareti yok (otomatik tahmin)"
+    elif guven_puani == 2:
+        guven_metni = "🟡 Orta - birkac noktaya dikkat et (otomatik tahmin)"
+    else:
+        guven_metni = "🔴 Dikkatli incele (otomatik tahmin)"
+
+    embed = discord.Embed(title=f"{target} hakkinda bilgi", color=0x5865F2, timestamp=now)
+    embed.set_thumbnail(url=target.display_avatar.url)
+
+    embed.add_field(
+        name="Discord hesap yasi",
+        value=f"{target.created_at.strftime('%d.%m.%Y')} ({account_age_days} gun)",
+        inline=True,
+    )
+    if getattr(target, "joined_at", None):
+        embed.add_field(
+            name="Sunucuya katilma",
+            value=f"{target.joined_at.strftime('%d.%m.%Y')} ({joined_days} gun)",
+            inline=True,
+        )
+
+    embed.add_field(name="Guvenilirlik (otomatik tahmin, kesin degil)", value=guven_metni, inline=False)
+    if guven_notlari:
+        embed.add_field(name="Dikkat edilecek noktalar", value="\n".join(f"- {n}" for n in guven_notlari), inline=False)
+
+    if registration:
+        embed.add_field(name="Kayitli isim", value=registration.get("isim", "-"), inline=True)
+        embed.add_field(name="Kayitli yas", value=str(registration.get("yas", "-")), inline=True)
+
+        roblox_username = registration.get("roblox_username")
+        if roblox_username:
+            try:
+                roblox_user = await get_roblox_user(roblox_username)
+            except Exception as e:
+                roblox_user = None
+                print(f"[UYARI] Roblox bilgisi alinamadi ({roblox_username}): {e}")
+
+            if roblox_user:
+                embed.add_field(name="Roblox kullanici adi", value=roblox_user["username"], inline=True)
+                embed.add_field(
+                    name="Roblox hesap yasi",
+                    value=format_roblox_created(roblox_user.get("created")),
+                    inline=True,
+                )
+                if roblox_user.get("is_banned"):
+                    embed.add_field(name="⚠️ Roblox durumu", value="Bu hesap banli gorunuyor.", inline=False)
+                embed.add_field(name="Roblox profili", value=roblox_user["profile_url"], inline=False)
+                if roblox_user.get("thumbnail_url"):
+                    embed.set_image(url=roblox_user["thumbnail_url"])
+            else:
+                embed.add_field(
+                    name="Roblox",
+                    value=f"Kayitli kullanici adi (`{roblox_username}`) su an dogrulanamadi.",
+                    inline=False,
+                )
+    else:
+        embed.add_field(name="Kayit durumu", value="Bu kullanici `/kayit` ile kayit olmamis.", inline=False)
+
+    await message.reply(embed=embed, mention_author=False)
+
+
+# ------------------------------------------------------------------
+# Arka plan kontrol dongusu - Kick canli/kategori/yayin sonu kontrolu
+# ------------------------------------------------------------------
+@tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
+async def check_streams():
+    data = load_data()
+    if not data:
+        return
+
+    all_slugs = set()
+    for entry in data.values():
+        all_slugs.update(entry.get("streamers", {}).keys())
+
+    if not all_slugs:
+        return
+
+    try:
+        statuses = get_channels_status(list(all_slugs))
+    except requests.exceptions.RequestException as e:
+        print(f"[HATA] Kick API istegi basarisiz: {e}")
+        return
+    except Exception as e:
+        print(f"[HATA] Beklenmeyen hata: {e}")
+        return
+
+    changed = False
+
+    for guild_id, entry in data.items():
+        streamers = entry.get("streamers", {})
+
+        for slug, state in streamers.items():
+            info = statuses.get(slug)
+            if info is None:
+                continue
+
+            was_live = state.get("is_live", False)
+            is_live = info["is_live"]
+            prev_category = state.get("category")
+            new_category = info.get("category")
+
+            live_channel_id = get_notify_channel_id(entry, "canli")
+            kategori_channel_id = get_notify_channel_id(entry, "kategori")
+
+            if is_live and not was_live and live_channel_id:
+                channel = client.get_channel(live_channel_id)
+                if channel is not None:
+                    embed = discord.Embed(
+                        title=f"{slug} canli yayina gecti",
+                        url=info["url"],
+                        description=info["title"] or "Yayin basladi.",
+                        color=0x53FC18,
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    if new_category:
+                        embed.add_field(name="Kategori", value=new_category, inline=True)
+                    if info.get("thumbnail"):
+                        embed.set_image(url=info["thumbnail"])
+                    try:
+                        sent_message = await channel.send(
+                            content=f"**{slug}** yayina girdi -> {info['url']}", embed=embed
+                        )
+                        # Thumbnail'i periyodik guncelleyebilmek icin mesaji hatirla
+                        state["live_message_id"] = sent_message.id
+                        state["live_channel_id"] = channel.id
+                    except discord.DiscordException as e:
+                        print(f"[HATA] Mesaj gonderilemedi: {e}")
+
+            elif not is_live and was_live and live_channel_id:
+                channel = client.get_channel(live_channel_id)
+                if channel is not None:
+                    embed = discord.Embed(
+                        title=f"{slug} yayini sonlandirdi",
+                        url=info["url"],
+                        description="Yayin sona erdi.",
+                        color=0x6B726C,
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    try:
+                        await channel.send(content=f"**{slug}** yayini bitirdi.", embed=embed)
+                    except discord.DiscordException as e:
+                        print(f"[HATA] Yayin sonu mesaji gonderilemedi: {e}")
+                state["live_message_id"] = None
+                state["live_channel_id"] = None
+
+            elif (
+                is_live
+                and was_live
+                and kategori_channel_id
+                and new_category
+                and prev_category
+                and new_category != prev_category
+            ):
+                channel = client.get_channel(kategori_channel_id)
+                if channel is not None:
+                    embed = discord.Embed(
+                        title=f"{slug} kategori degistirdi",
+                        url=info["url"],
+                        description=f"**{prev_category}** ➜ **{new_category}**",
+                        color=0x5865F2,
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    try:
+                        await channel.send(
+                            content=f"**{slug}** kategoriyi degistirdi: **{new_category}**",
+                            embed=embed,
+                        )
+                    except discord.DiscordException as e:
+                        print(f"[HATA] Kategori mesaji gonderilemedi: {e}")
+
+            # Yayin devam ediyorsa, canli bildirim mesajinin thumbnail'ini
+            # guncel tut (Kick'in ana ekran goruntusu periyodik degisir).
+            if is_live and state.get("live_message_id") and state.get("live_channel_id") and info.get("thumbnail"):
+                try:
+                    live_channel = client.get_channel(state["live_channel_id"])
+                    if live_channel is not None:
+                        msg = await live_channel.fetch_message(state["live_message_id"])
+                        if msg.embeds:
+                            updated_embed = msg.embeds[0]
+                            updated_embed.set_image(url=info["thumbnail"])
+                            if info.get("title"):
+                                updated_embed.description = info["title"]
+                            await msg.edit(embed=updated_embed)
+                except discord.NotFound:
+                    state["live_message_id"] = None
+                    state["live_channel_id"] = None
+                except discord.DiscordException as e:
+                    print(f"[UYARI] Thumbnail guncellenemedi ({slug}): {e}")
+
+            # --- DENEYSEL: yeni klip kontrolu ---
+            klip_channel_id = get_notify_channel_id(entry, "klip")
+            if klip_channel_id:
+                try:
+                    latest_clip = await get_latest_clip(slug)
+                except Exception as e:
+                    latest_clip = None
+                    print(f"[UYARI] Klip bilgisi alinamadi ({slug}) - bu ozellik resmi degil, calismayabilir: {e}")
+
+                if latest_clip and latest_clip.get("id"):
+                    last_seen_clip_id = state.get("last_clip_id")
+                    if last_seen_clip_id != latest_clip["id"]:
+                        if last_seen_clip_id is not None:  # ilk kontrolde spam yapma, sadece referans al
+                            channel = client.get_channel(klip_channel_id)
+                            if channel is not None:
+                                embed = discord.Embed(
+                                    title=f"{slug} icin yeni klip: {latest_clip['title']}",
+                                    url=latest_clip["url"],
+                                    color=0xFFB454,
+                                    timestamp=datetime.now(timezone.utc),
+                                )
+                                if latest_clip.get("creator"):
+                                    embed.add_field(name="Klip sahibi", value=latest_clip["creator"], inline=True)
+                                if latest_clip.get("thumbnail"):
+                                    embed.set_image(url=latest_clip["thumbnail"])
+                                try:
+                                    await channel.send(content=f"🎬 **{slug}** icin yeni klip!", embed=embed)
+                                except discord.DiscordException as e:
+                                    print(f"[HATA] Klip mesaji gonderilemedi: {e}")
+                        state["last_clip_id"] = latest_clip["id"]
+                        changed = True
+
+            # --- DENEYSEL: sabitlenen mesaj kontrolu ---
+            sabitmesaj_channel_id = get_notify_channel_id(entry, "sabitmesaj")
+            if sabitmesaj_channel_id:
+                try:
+                    pinned = await get_pinned_message(slug)
+                except Exception as e:
+                    pinned = None
+                    print(f"[UYARI] Sabit mesaj bilgisi alinamadi ({slug}) - bu ozellik resmi degil, calismayabilir: {e}")
+
+                pinned_id = pinned.get("id") if pinned else None
+                last_seen_pinned_id = state.get("last_pinned_id")
+                if pinned_id != last_seen_pinned_id:
+                    if pinned_id is not None and last_seen_pinned_id is not None:
+                        # yeni bir mesaj sabitlendi (ilk tespitte spam yapma)
+                        channel = client.get_channel(sabitmesaj_channel_id)
+                        if channel is not None:
+                            embed = discord.Embed(
+                                title=f"{slug} yeni bir mesaj sabitledi",
+                                description=pinned.get("content", ""),
+                                color=0x53FC18,
+                                timestamp=datetime.now(timezone.utc),
+                            )
+                            if pinned.get("sender"):
+                                embed.add_field(name="Yazan", value=pinned["sender"], inline=True)
+                            try:
+                                await channel.send(content=f"📌 **{slug}** bir mesaj sabitledi!", embed=embed)
+                            except discord.DiscordException as e:
+                                print(f"[HATA] Sabit mesaj bildirimi gonderilemedi: {e}")
+                    state["last_pinned_id"] = pinned_id
+                    changed = True
+
+            if is_live != was_live or new_category != prev_category:
+                state["is_live"] = is_live
+                state["category"] = new_category
+                changed = True
+
+    if changed:
+        save_data(data)
+
+
+@check_streams.before_loop
+async def before_check_streams():
+    await client.wait_until_ready()
+
+
+if __name__ == "__main__":
+    if not DISCORD_BOT_TOKEN:
+        raise SystemExit("HATA: DISCORD_BOT_TOKEN ortam degiskeni ayarlanmamis.")
+    if not KICK_CLIENT_ID or not KICK_CLIENT_SECRET:
+        raise SystemExit("HATA: KICK_CLIENT_ID / KICK_CLIENT_SECRET ortam degiskenleri ayarlanmamis.")
+
+    client.run(DISCORD_BOT_TOKEN)
